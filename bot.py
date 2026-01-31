@@ -1,9 +1,6 @@
 import logging
-import telebot
-import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, CallbackContext
-
 
 # Настройка логирования
 logging.basicConfig(
@@ -12,7 +9,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot = telebot.Telebot(os.getenv('BOT_TOKEN')
+# Ваш токен
+TOKEN = "8455579686:AAFV9mGYG_cIraCM6pFY66MBzDh4wkjRKvQ"
 
 # ---------- ОБРАБОТЧИК /start ----------
 async def start(update: Update, context: CallbackContext) -> None:
