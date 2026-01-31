@@ -10,7 +10,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Ваш токен
-
+TOKEN = "8455579686:AAFV9mGYG_cIraCM6pFY66MBzDh4wkjRKvQ"
 # ---------- ОБРАБОТЧИК /start ----------
 async def start(update: Update, context: CallbackContext) -> None:
     welcome_text = (
