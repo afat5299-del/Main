@@ -10,7 +10,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Ваш токен
-
+TOKEN = "8455579686:AAFV9mGYG_cIraCM6pFY66MBzDh4wkjRKvQ"
 # ---------- ОБРАБОТЧИК /start ----------
 async def start(update: Update, context: CallbackContext) -> None:
     welcome_text = (
@@ -64,7 +64,7 @@ async def button_handler(update: Update, context: CallbackContext) -> None:
         keyboard = [[
             InlineKeyboardButton(
                 "Пройти регистрацию", 
-                url="https://partners-app.yandex.ru/team_ref/0a6ff9f5a4794e73b9d0c05c0b936c31?locale=ru")],
+                url="https://partners-app.yandex.ru/team_ref/3139f70048bd4957bc179333d9a9cb9f?locale=ru")],
                 [InlineKeyboardButton("Я зарегистрировался и жду активацию", callback_data='registered_waiting')],
                 [InlineKeyboardButton("Не получилось зарегистрироваться", url="https://t.me/m/fuvfwIcDZmNi")]
         ]
