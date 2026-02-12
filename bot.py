@@ -64,7 +64,7 @@ async def button_handler(update: Update, context: CallbackContext) -> None:
         keyboard = [[
             InlineKeyboardButton(
                 "Пройти регистрацию", 
-                url="https://partners-app.yandex.ru/team_ref/1ff6d6b8bc24403f9b92abc4984c0787?locale=ru")],
+                url="https://partners-app.yandex.ru/team_ref/b31c762ac7e54db383acc4423dfe6b86?locale=ru")],
                 [InlineKeyboardButton("Я зарегистрировался и жду активацию", callback_data='registered_waiting')],
                 [InlineKeyboardButton("Не получилось зарегистрироваться", url="https://t.me/m/fuvfwIcDZmNi")]
         ]
