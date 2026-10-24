@@ -11,6 +11,7 @@ from typing import Optional
 from urllib.parse import urlparse, unquote
 import asyncio
 import json
+import os
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -30,20 +31,22 @@ from telegram.ext import (
 )
 
 # ====================== НАСТРОЙКИ ======================
-# Вставь значения прямо сюда. Не отправляй файл с настоящими токенами посторонним.
-BOT_TOKEN = "8980549111:AAGobdsSazo_yuy1a68rIpV8sdTqsixshp0"
-TARGET_CHANNEL = "@ffffhhy1"
-
-MAX_BOT_TOKEN = "f9LHodD0cOLgmaZn46WBNS3wfD8_DjR0weBd0DOwN7R-PmTKRUz2Kgfkq5MD5mLHVFLTChaWGHsOptY4xDTs"
-# Числовой chat_id канала MAX, не ссылка на канал.
-MAX_TARGET_USER_ID = "ВСТАВЬ_ЧИСЛОВОЙ_USER_ID_MAX"
+# Токены и секреты задаются в переменных окружения Bothost.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@ffffhhy1").strip()
 
 TELEGRAM_CHANNEL_URL = "https://t.me/+zOfQvQP-qcxmZjcy"
 MAX_CHANNEL_URL = "https://max.ru/channel_skidochnayapromo"
 
 TELEGRAM_CHANNEL_TEXT = "Подписаться на наш канал"
 MAX_CHANNEL_TEXT = "Наш канал в Max"
-MAX_API_BASE = "https://platform-api2.max.ru"
+
+# URL отдельного MAX-сервиса и общий секрет для проверки запроса.
+MAX_RELAY_URL = os.getenv(
+    "MAX_RELAY_URL",
+    "https://bot-1792880771-8826-lxcekl.bothost.tech",
+).strip().rstrip("/")
+MAX_RELAY_SECRET = os.getenv("MAX_RELAY_SECRET", "").strip()
 
 # Ограничение размера ответа страницы и сетевого тайм-аута.
 REQUEST_TIMEOUT_SECONDS = 12
@@ -304,79 +307,50 @@ def make_post_html(draft: Draft, platform: str = "telegram") -> str:
     return "\n".join(lines)
 
 
-async def upload_photo_to_max(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str) -> str:
-    """Скачивает фото из Telegram и загружает его в MAX; возвращает media token."""
-    if not MAX_BOT_TOKEN or MAX_BOT_TOKEN.startswith("ВСТАВЬ_"):
-        raise RuntimeError("Не указан MAX_BOT_TOKEN в настройках кода.")
-    tg_file = await context.bot.get_file(photo_file_id)
-    photo_bytes = bytes(await tg_file.download_as_bytearray())
-
-    headers = {"Authorization": MAX_BOT_TOKEN, "Accept": "application/json"}
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{MAX_API_BASE}/uploads?type=image", headers=headers) as response:
-            payload = await response.json(content_type=None)
-            if response.status >= 400:
-                raise RuntimeError(f"MAX не выдал ссылку для загрузки фото: HTTP {response.status}: {payload}")
-        upload_url = payload.get("url")
-        if not upload_url:
-            raise RuntimeError(f"MAX API не вернул URL для загрузки изображения: {payload}")
-
-        form = aiohttp.FormData()
-        form.add_field("data", photo_bytes, filename="product.jpg", content_type="image/jpeg")
-        async with session.post(upload_url, headers={"Authorization": MAX_BOT_TOKEN}, data=form) as response:
-            uploaded = await response.json(content_type=None)
-            if response.status >= 400:
-                raise RuntimeError(f"MAX не принял фото: HTTP {response.status}: {uploaded}")
-
-    token = uploaded.get("token") if isinstance(uploaded, dict) else None
-    if not token and isinstance(uploaded, dict):
-        photos = uploaded.get("photos", {})
-        if isinstance(photos, dict):
-            for photo_info in photos.values():
-                if isinstance(photo_info, dict) and photo_info.get("token"):
-                    token = photo_info["token"]
-                    break
-    if not token:
-        raise RuntimeError(f"MAX не вернул токен загруженного изображения: {uploaded}")
-    return token
-
-
 async def publish_to_max(context: ContextTypes.DEFAULT_TYPE, draft: Draft) -> None:
-    """Публикует отдельную MAX-версию поста через официальный MAX Bot API."""
-    if not MAX_BOT_TOKEN or MAX_BOT_TOKEN.startswith("ВСТАВЬ_"):
-        raise RuntimeError("Не указан MAX_BOT_TOKEN в настройках кода.")
-    if not MAX_TARGET_USER_ID or MAX_TARGET_USER_ID.startswith("ВСТАВЬ_"):
-        raise RuntimeError("Не указан MAX_TARGET_USER_ID в настройках кода.")
-    try:
-        user_id = int(MAX_TARGET_USER_ID)
-    except ValueError as exc:
-        raise RuntimeError("MAX_TARGET_USER_ID должен быть числовым user_id пользователя MAX.") from exc
+    """Передаёт готовый пост в отдельный MAX-сервис, который публикует его в канал."""
+    if not MAX_RELAY_URL:
+        raise RuntimeError("Не задан MAX_RELAY_URL в настройках Telegram-бота.")
+    if not MAX_RELAY_SECRET:
+        raise RuntimeError("Не задан MAX_RELAY_SECRET в настройках Telegram-бота.")
 
-    headers = {"Authorization": MAX_BOT_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
-    body = {"text": make_post_html(draft, platform="max"), "format": "html"}
-    if draft.photo_file_id:
-        media_token = await upload_photo_to_max(context, draft.photo_file_id)
-        body["attachments"] = [{"type": "image", "payload": {"token": media_token}}]
+    post_text = make_post_html(draft, platform="max")
+    headers = {"X-Relay-Secret": MAX_RELAY_SECRET}
+    timeout = aiohttp.ClientTimeout(total=90)
 
-    timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt, delay in enumerate((0.8, 1.5, 3.0), start=1):
-            if draft.photo_file_id:
-                await asyncio.sleep(delay)
+        if draft.photo_file_id:
+            tg_file = await context.bot.get_file(draft.photo_file_id)
+            photo_bytes = bytes(await tg_file.download_as_bytearray())
+            form = aiohttp.FormData()
+            form.add_field("text", post_text)
+            form.add_field(
+                "photo",
+                photo_bytes,
+                filename="product.jpg",
+                content_type="image/jpeg",
+            )
             async with session.post(
-                f"{MAX_API_BASE}/messages",
-                params={"user_id": user_id},
+                f"{MAX_RELAY_URL}/publish",
                 headers=headers,
-                json=body,
+                data=form,
             ) as response:
-                result = await response.json(content_type=None)
-                if response.status < 400:
-                    return
-                error_text = json.dumps(result, ensure_ascii=False)
-                if "attachment.not.ready" in error_text and attempt < 3:
-                    continue
-                raise RuntimeError(f"MAX API вернул HTTP {response.status}: {error_text}")
+                result_text = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"MAX-сервис вернул HTTP {response.status}: {result_text[:1000]}"
+                    )
+        else:
+            async with session.post(
+                f"{MAX_RELAY_URL}/publish",
+                headers=headers,
+                json={"text": post_text},
+            ) as response:
+                result_text = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"MAX-сервис вернул HTTP {response.status}: {result_text[:1000]}"
+                    )
 
 
 def build_yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
@@ -672,9 +646,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data == "publish_help":
         await query.message.reply_text(
-            "Вставь TARGET_CHANNEL в настройки в начале bot.py и сделай Telegram-бота "
-            "администратором канала с правом публикации. Для MAX укажи числовой "
-            "MAX_TARGET_USER_ID; получатель должен предварительно запустить MAX-бота."
+            "Настрой TARGET_CHANNEL и добавь Telegram-боту права публикации. "
+            "Для MAX задай MAX_RELAY_URL и MAX_RELAY_SECRET в переменных окружения Bothost."
         )
         return
 
@@ -714,7 +687,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 errors.append(f"MAX: {exc}")
 
         if draft.telegram_published and draft.max_published:
-            await query.message.reply_text("✅ Пост отправлен в Telegram-канал и личный диалог MAX.")
+            await query.message.reply_text("✅ Пост отправлен в Telegram-канал и передан MAX-сервису для публикации в MAX-канал.")
             reset_draft(user_id)
         else:
             published = []
@@ -868,7 +841,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬ_"):
-        raise SystemExit("Вставь настоящий BOT_TOKEN в настройки в начале файла bot.py.")
+        raise SystemExit("Не задан BOT_TOKEN в переменных окружения Bothost.")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
