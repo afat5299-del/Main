@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from html import escape
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -45,7 +45,7 @@ TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 TELEGRAM_CHANNEL_URL = "https://t.me/+zOfQvQP-qcxmZjcy"
 MAX_CHANNEL_URL = "https://max.ru/channel_skidochnayapromo"
 
-TELEGRAM_CHANNEL_TEXT = "Подписаться наш канал"
+TELEGRAM_CHANNEL_TEXT = "Подписаться на наш канал"
 MAX_CHANNEL_TEXT = "Наш канал в Max"
 
 # Ограничение размера ответа страницы и сетевого тайм-аута.
@@ -116,8 +116,8 @@ def clean_title(value: str) -> str:
     return value[:250]
 
 
-# Точные названия для известных карточек. Для остальных товаров бот попробует
-# получить название со страницы, а затем восстановить его из транслита в URL.
+# Точные названия для товаров, которые уже встречались.
+# Если добавятся новые примеры, сюда можно добавить ID карточки и название.
 PRODUCT_TITLE_OVERRIDES = {
     "4954195926": "Пяткоудерживатель для обуви / ортопедический задник самоклеющийся",
     "102106004646": 'Дженга падающая башня ЛАС играс "Классика" 54 бруска, деревянная, от 6 лет',
@@ -127,61 +127,57 @@ PRODUCT_TITLE_OVERRIDES = {
 }
 
 
-def get_product_parts(url: str) -> tuple[Optional[str], Optional[str]]:
-    """Возвращает slug и ID из ссылки вида /card/slug/123456."""
-    path = urlparse(url).path
-    match = re.search(r"/card/([^/]+)/(\d+)", path)
-    if not match:
-        return None, None
-    return match.group(1), match.group(2)
+def product_id_from_url(url: str) -> Optional[str]:
+    path = unquote(urlparse(url).path)
+    # В карточках Яндекс Маркета ID обычно стоит последним числовым сегментом.
+    match = re.search(r"/(?:card/)?(?:[^/]+/)?(\d{7,})(?:/|$)", path)
+    if match:
+        return match.group(1)
+    numbers = re.findall(r"\d{7,}", path)
+    return numbers[-1] if numbers else None
+
+
+def slug_from_url(url: str) -> Optional[str]:
+    path = unquote(urlparse(url).path).strip("/")
+    parts = path.split("/")
+    if "card" in parts:
+        idx = parts.index("card")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
 
 
 def transliterated_slug_to_russian(slug: str) -> Optional[str]:
-    """Запасное преобразование транслитерации из URL в кириллицу."""
-    if not slug:
+    """Запасная эвристика: пытается преобразовать латинский slug в кириллицу."""
+    if not slug or not re.search(r"[a-z]", slug, re.I):
         return None
-    words = re.sub(r"[-_]+", " ", slug).strip().split()
-    translit = [
+    text = re.sub(r"[-_]+", " ", slug).strip()
+    # Частые сочетания сначала, чтобы не разбивать их по одной букве.
+    replacements = [
         ("shch", "щ"), ("sch", "щ"), ("yo", "ё"), ("zh", "ж"),
         ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"),
-        ("yu", "ю"), ("ya", "я"), ("ye", "е"), ("eh", "э"),
-        ("a", "а"), ("b", "б"), ("v", "в"), ("g", "г"),
-        ("d", "д"), ("e", "е"), ("z", "з"), ("i", "и"),
-        ("y", "й"), ("k", "к"), ("l", "л"), ("m", "м"),
-        ("n", "н"), ("o", "о"), ("p", "п"), ("r", "р"),
-        ("s", "с"), ("t", "т"), ("u", "у"), ("f", "ф"),
-        ("h", "х"), ("c", "к"), ("j", "дж"), ("w", "в"),
+        ("sh", "ш"), ("yu", "ю"), ("ya", "я"), ("ye", "е"),
+        ("jo", "ё"), ("a", "а"), ("b", "б"), ("v", "в"),
+        ("g", "г"), ("d", "д"), ("e", "е"), ("z", "з"),
+        ("i", "и"), ("y", "й"), ("k", "к"), ("l", "л"),
+        ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"),
+        ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"),
+        ("f", "ф"), ("h", "х"), ("c", "к"), ("w", "в"),
         ("x", "кс"), ("q", "к"),
     ]
-    converted_words = []
-    for word in words:
-        lower = word.lower()
-        result = []
-        i = 0
-        while i < len(lower):
-            for latin, cyrillic in translit:
-                if lower.startswith(latin, i):
-                    result.append(cyrillic)
-                    i += len(latin)
-                    break
-            else:
-                result.append(lower[i])
-                i += 1
-        converted_words.append("".join(result))
-    title = " ".join(converted_words).strip()
-    return title[0].upper() + title[1:] if title else None
+    result = text.lower()
+    for old, new_char in replacements:
+        result = result.replace(old, new_char)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result[:250].capitalize() if result else None
 
 
-async def fetch_product_title(url: str) -> Optional[str]:
+async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
+    """Раскрывает короткую ссылку редиректами и пытается получить название товара.
+
+    Возвращает (конечный URL, название или None). Короткие ссылки вида /cc/XXXX
+    не содержат название сами по себе, поэтому сначала переходим по редиректу.
     """
-    Пробует получить заголовок товара из обычного HTML.
-    Это не гарантируется: Маркет может отдавать динамическую страницу,
-    CAPTCHA или заголовок общего раздела вместо товара.
-    """
-    slug, product_id = get_product_parts(url)
-    if product_id and product_id in PRODUCT_TITLE_OVERRIDES:
-        return PRODUCT_TITLE_OVERRIDES[product_id]
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -191,25 +187,21 @@ async def fetch_product_title(url: str) -> Optional[str]:
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     }
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    final_url = url
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout, headers=headers
-        ) as session:
-            async with session.get(
-                url, allow_redirects=True, max_redirects=5
-            ) as response:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True, max_redirects=10) as response:
+                final_url = str(response.url)
                 if response.status >= 400:
                     logger.info("Страница товара ответила HTTP %s", response.status)
-                    return None
+                    return final_url, None
                 content_type = response.headers.get("Content-Type", "")
                 if "html" not in content_type.lower():
-                    return None
+                    return final_url, None
                 raw = await response.content.read(MAX_HTML_BYTES)
                 html = raw.decode(response.charset or "utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "html.parser")
-
-        # Сначала ищем метаданные, затем заголовок страницы.
         candidates = [
             soup.find("meta", attrs={"property": "og:title"}),
             soup.find("meta", attrs={"name": "twitter:title"}),
@@ -218,27 +210,21 @@ async def fetch_product_title(url: str) -> Optional[str]:
             if tag and tag.get("content"):
                 title = clean_title(tag["content"])
                 if title and "яндекс маркет" not in title.lower():
-                    return title
+                    return final_url, title
 
         h1 = soup.find("h1")
         if h1:
             title = clean_title(h1.get_text(" ", strip=True))
-            if title:
-                return title
+            if title and "яндекс маркет" not in title.lower():
+                return final_url, title
 
         if soup.title and soup.title.string:
             title = clean_title(soup.title.string)
             if title and "яндекс маркет" not in title.lower():
-                return title
+                return final_url, title
     except Exception as exc:
-        logger.info("Не удалось автоматически получить название: %s", exc)
-
-    # Последний резерв: восстановить название из транслита в URL.
-    fallback_title = transliterated_slug_to_russian(slug or "")
-    if fallback_title:
-        logger.info("Использовано запасное название из URL: %s", fallback_title)
-        return fallback_title
-    return None
+        logger.info("Не удалось раскрыть ссылку или получить название: %s", exc)
+    return final_url, None
 
 
 def promo_from_text(text: str) -> Optional[str]:
@@ -272,7 +258,7 @@ def remove_urls_and_promo(text: str) -> str:
 
 def footer_html() -> str:
     return (
-        f'📣 <a href="{TELEGRAM_CHANNEL_URL}">Подписаться на наш канал</a>\n'
+        f'📣 <a href="{TELEGRAM_CHANNEL_URL}">{escape(TELEGRAM_CHANNEL_TEXT)}</a>\n'
         f'📢 <a href="{MAX_CHANNEL_URL}">{escape(MAX_CHANNEL_TEXT)}</a>'
     )
 
@@ -289,15 +275,14 @@ def make_post_html(draft: Draft) -> str:
         lines.append(f"🔥 <b>{escape(draft.product_name)}</b>")
     elif draft.product_url:
         lines.append(
-            f'🔥 <a href="{escape(draft.product_url, quote=True)}">'
+            f'<a href="{escape(draft.product_url, quote=True)}">'
             "Посмотреть товар на Яндекс Маркете</a>"
         )
 
     if draft.promo_code:
         lines.extend(["", f"🎟 <b>Промокод: {escape(draft.promo_code)}</b>"])
 
-    if lines:
-        lines.extend(["", "Не пропускайте новые скидки и выгодные предложения!", ""])
+    lines.extend(["", "Не пропускайте новые скидки и выгодные предложения!", ""])
     lines.append(footer_html())
     return "\n".join(lines)
 
@@ -488,7 +473,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if draft.product_url and not draft.product_name:
         if looks_like_yandex_market(draft.product_url):
-            draft.product_name = await fetch_product_title(draft.product_url)
+            original_url = draft.product_url
+            final_url, fetched_title = await fetch_product_details(original_url)
+            # Сохраняем раскрытый адрес, чтобы ссылка в посте вела прямо на товар.
+            if looks_like_yandex_market(final_url):
+                draft.product_url = final_url
+            product_id = product_id_from_url(final_url) or product_id_from_url(original_url)
+            draft.product_name = (
+                fetched_title
+                or PRODUCT_TITLE_OVERRIDES.get(product_id or "")
+                or transliterated_slug_to_russian(slug_from_url(final_url) or "")
+            )
         else:
             # Для любой другой ссылки оставляем название неизвестным.
             draft.product_name = None
