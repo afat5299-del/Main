@@ -3,7 +3,6 @@ Telegram-бот для подготовки постов о товарах.
 Python 3.10+
 """
 
-import asyncio
 import logging
 import os
 import re
@@ -19,7 +18,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -41,11 +39,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Примеры: @my_channel или -1001234567890
 # Оставь пустым, если нужна только подготовка поста в личном чате.
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
-
-# Необязательная интеграция с API реферальной программы Яндекс Маркета.
-# В .env укажи новый токен и свой CLID из кабинета; токен не вставляй в код.
-YANDEX_MARKET_API_TOKEN = os.getenv("YANDEX_MARKET_API_TOKEN", "").strip()
-YANDEX_MARKET_CLID = os.getenv("YANDEX_MARKET_CLID", "").strip()
 
 TELEGRAM_CHANNEL_URL = "https://t.me/+zOfQvQP-qcxmZjcy"
 MAX_CHANNEL_URL = "https://max.ru/channel_skidochnayapromo"
@@ -71,6 +64,10 @@ class Draft:
     product_url: Optional[str] = None
     product_name: Optional[str] = None
     promo_code: Optional[str] = None
+    discount_type: Optional[str] = None  # "percent" или "rubles"
+    discount_value: Optional[str] = None
+    promo_discount_asked: bool = False
+    body_text: str = "Не пропускайте новые скидки и выгодные предложения"
     pending_question: Optional[str] = None
     waiting_for: Optional[str] = None
     # Несколько фото поддерживаются, но в этом примере используется первое.
@@ -129,6 +126,7 @@ PRODUCT_TITLE_OVERRIDES = {
     "103673156134": "Форма из углеродистой стали для выпечки Pragma Rangl со съемным дном, 26 см, чёрная",
     "103566355440": "Швабра для уборки Homsly, с распылителем и насадкой из микрофибры TB010",
     "4811646823": "Защитное стекло на iPhone 17 Pro Max, матовое, антиблик, с автоматической установкой",
+    "4710058307": "Набор столовой посуды 16 предметов 4 персоны Pragma Monvo, керамика, серый",
 }
 
 
@@ -152,71 +150,12 @@ def slug_from_url(url: str) -> Optional[str]:
     return None
 
 
-def transliterated_slug_to_russian(slug: str) -> Optional[str]:
-    """Запасная эвристика: пытается преобразовать латинский slug в кириллицу."""
-    if not slug or not re.search(r"[a-z]", slug, re.I):
-        return None
-    text = re.sub(r"[-_]+", " ", slug).strip()
-    # Частые сочетания сначала, чтобы не разбивать их по одной букве.
-    replacements = [
-        ("shch", "щ"), ("sch", "щ"), ("yo", "ё"), ("zh", "ж"),
-        ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"),
-        ("sh", "ш"), ("yu", "ю"), ("ya", "я"), ("ye", "е"),
-        ("jo", "ё"), ("a", "а"), ("b", "б"), ("v", "в"),
-        ("g", "г"), ("d", "д"), ("e", "е"), ("z", "з"),
-        ("i", "и"), ("y", "й"), ("k", "к"), ("l", "л"),
-        ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"),
-        ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"),
-        ("f", "ф"), ("h", "х"), ("c", "к"), ("w", "в"),
-        ("x", "кс"), ("q", "к"),
-    ]
-    result = text.lower()
-    for old, new_char in replacements:
-        result = result.replace(old, new_char)
-    result = re.sub(r"\s+", " ", result).strip()
-    return result[:250].capitalize() if result else None
-
-
-async def fetch_title_from_yandex_api(url: str) -> Optional[str]:
-    """Получает точное название товара через API реферальной программы Маркета.
-
-    Для работы нужны YANDEX_MARKET_API_TOKEN и YANDEX_MARKET_CLID в .env.
-    Метод partner/link/create возвращает link.title для поддерживаемых URL.
-    """
-    if not YANDEX_MARKET_API_TOKEN or not YANDEX_MARKET_CLID:
-        return None
-    api_url = "https://api.content.market.yandex.ru/v3/affiliate/partner/link/create"
-    headers = {"Authorization": f"OAuth {YANDEX_MARKET_API_TOKEN}"}
-    params = {"url": url, "clid": YANDEX_MARKET_CLID, "format": "json"}
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(api_url, headers=headers, params=params) as response:
-                body_text = await response.text()
-                if response.status != 200:
-                    logger.warning("Yandex Market API: HTTP %s; ответ: %s", response.status, body_text[:300])
-                    return None
-                try:
-                    data = await response.json(content_type=None)
-                except Exception:
-                    logger.warning("Yandex Market API вернул ответ не в JSON")
-                    return None
-        link_data = data.get("link") or {}
-        title = clean_title(str(link_data.get("title") or ""))
-        if title and "яндекс маркет" not in title.lower():
-            logger.info("Название товара получено через API Яндекс Маркета")
-            return title
-        logger.info("API Яндекс Маркета не вернул название товара")
-    except Exception as exc:
-        logger.warning("Ошибка запроса к API Яндекс Маркета: %s", exc)
-    return None
-
-
 async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
-    """Раскрывает короткую ссылку редиректами и пытается получить название товара.
+    """Раскрывает короткую ссылку, но возвращает исходную ссылку отдельно от названия.
 
-    Возвращает (конечный URL, название или None). Короткие ссылки вида /cc/XXXX
-    не содержат название сами по себе, поэтому сначала переходим по редиректу.
+    Для названия в первую очередь используются структурированные данные карточки
+    Product и заголовок H1. Они обычно точнее общего og:title, который иногда
+    содержит SEO-slug с неграмотной транслитерацией.
     """
     headers = {
         "User-Agent": (
@@ -242,26 +181,72 @@ async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
                 html = raw.decode(response.charset or "utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "html.parser")
-        candidates = [
-            soup.find("meta", attrs={"property": "og:title"}),
-            soup.find("meta", attrs={"name": "twitter:title"}),
-        ]
-        for tag in candidates:
-            if tag and tag.get("content"):
-                title = clean_title(tag["content"])
-                if title and "яндекс маркет" not in title.lower():
-                    return final_url, title
 
+        def usable_title(value: object) -> Optional[str]:
+            title = clean_title(str(value or ""))
+            title = re.sub(r"\s*[|·]\s*Яндекс Маркет.*$", "", title, flags=re.I).strip()
+            title = re.sub(r"\s+", " ", title)
+            if not title or len(title) < 4:
+                return None
+            if "яндекс маркет" in title.lower() and len(title) < 70:
+                return None
+            # Отсекаем URL/технические slug и пустые заголовки.
+            if title.startswith(("http://", "https://")):
+                return None
+            if re.fullmatch(r"[a-z0-9_-]+", title, flags=re.I):
+                return None
+            return title[:250]
+
+        # Сначала собираем название из schema.org Product. Эти данные чаще всего
+        # содержат нормальное полное название, а не SEO-заголовок страницы.
+        import json
+        product_candidates = []
+
+        def walk_json(node):
+            if isinstance(node, dict):
+                node_type = node.get("@type", "")
+                types = node_type if isinstance(node_type, list) else [node_type]
+                if any(str(t).lower() == "product" for t in types) and node.get("name"):
+                    product_candidates.append(node["name"])
+                for value in node.values():
+                    walk_json(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk_json(value)
+
+        for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+            try:
+                walk_json(json.loads(script.string or script.get_text()))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+
+        candidates = list(product_candidates)
         h1 = soup.find("h1")
         if h1:
-            title = clean_title(h1.get_text(" ", strip=True))
-            if title and "яндекс маркет" not in title.lower():
-                return final_url, title
+            candidates.append(h1.get_text(" ", strip=True))
+        for attrs in (
+            {"property": "og:title"},
+            {"name": "twitter:title"},
+        ):
+            tag = soup.find("meta", attrs=attrs)
+            if tag and tag.get("content"):
+                candidates.append(tag["content"])
+        if soup.title:
+            candidates.append(soup.title.get_text(" ", strip=True))
 
-        if soup.title and soup.title.string:
-            title = clean_title(soup.title.string)
-            if title and "яндекс маркет" not in title.lower():
-                return final_url, title
+        seen = set()
+        for candidate in candidates:
+            title = usable_title(candidate)
+            if not title:
+                continue
+            key = title.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            # Не берём технические заголовки из длинных адресных slug.
+            if title.count("-") >= 5 and not re.search(r"[А-ЯЁа-яё]", title):
+                continue
+            return final_url, title
     except Exception as exc:
         logger.info("Не удалось раскрыть ссылку или получить название: %s", exc)
     return final_url, None
@@ -321,8 +306,15 @@ def make_post_html(draft: Draft) -> str:
 
     if draft.promo_code:
         lines.extend(["", f"🎟 <b>Промокод: {escape(draft.promo_code)}</b>"])
+        if draft.discount_value and draft.discount_type == "percent":
+            lines.append(f"💸 <b>Скидка: {escape(draft.discount_value)}%</b>")
+        elif draft.discount_value and draft.discount_type == "rubles":
+            lines.append(f"💸 <b>Скидка: {escape(draft.discount_value)} ₽</b>")
 
-    lines.extend(["", "Не пропускайте новые скидки и выгодные предложения!", ""])
+    if draft.body_text.strip():
+        lines.extend(["", escape(draft.body_text.strip()), ""])
+    else:
+        lines.append("")
     lines.append(footer_html())
     return "\n".join(lines)
 
@@ -343,6 +335,8 @@ def build_preview_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Опубликовать в канал", callback_data="publish")],
         [InlineKeyboardButton("✏️ Изменить название", callback_data="edit_title")],
         [InlineKeyboardButton("✏️ Изменить промокод", callback_data="edit_promo")],
+        [InlineKeyboardButton("💸 Изменить скидку", callback_data="edit_discount")],
+        [InlineKeyboardButton("📝 Изменить текст поста", callback_data="edit_body")],
         [InlineKeyboardButton("🔗 Изменить ссылку", callback_data="edit_url")],
         [InlineKeyboardButton("🔄 Создать ещё", callback_data="new")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
@@ -434,6 +428,14 @@ async def ask_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if draft.promo_code and not draft.promo_discount_asked:
+        draft.pending_question = "discount"
+        await message.reply_text(
+            "Добавить размер скидки к промокоду?",
+            reply_markup=build_yes_no_keyboard("discount"),
+        )
+        return
+
     await send_preview(update, context)
 
 
@@ -471,83 +473,118 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     draft = get_draft(user.id)
     text = message.caption or message.text or ""
+    waiting = draft.waiting_for
+    url = find_url(text)
+    promo = promo_from_text(text)
 
-    # Принимаем фото из сообщения или подписи к фото.
     if message.photo:
         draft.photo_file_id = message.photo[-1].file_id
 
-    url = find_url(text)
-    if url:
-        draft.product_url = url
-        draft.product_name = None
-
-    promo = promo_from_text(text)
-    if promo:
-        draft.promo_code = promo
-
-    # Если пользователь находится в режиме ручного ввода, учитываем обычный текст.
-    if draft.waiting_for == "title" and text and not url and not promo:
+    # Режимы редактирования: после ввода возвращаем пользователя к предпросмотру.
+    if waiting == "title" and text.strip() and not url:
         draft.product_name = clean_title(text)
         draft.waiting_for = None
-    elif draft.waiting_for == "promo" and text and not url and not promo:
+        await send_preview(update, context)
+        return
+
+    if waiting == "promo" and text.strip() and not url:
         candidate = text.strip()
-        if candidate.lower() not in {"нет", "не", "пропустить", "готово"}:
-            draft.promo_code = candidate[:40]
+        if candidate.lower() in {"нет", "не", "удалить", "убрать", "пропустить"}:
+            draft.promo_code = None
+            draft.discount_type = None
+            draft.discount_value = None
+            draft.promo_discount_asked = True
+        else:
+            draft.promo_code = (promo or candidate)[:40]
+            draft.promo_discount_asked = False
         draft.waiting_for = None
-    elif draft.waiting_for == "url" and text and not url:
-        if text.strip().lower() not in {"нет", "не", "пропустить", "готово"}:
+        if draft.promo_code and not draft.promo_discount_asked:
+            draft.pending_question = "discount"
+            await message.reply_text(
+                "Добавить размер скидки к промокоду?",
+                reply_markup=build_yes_no_keyboard("discount"),
+            )
+        else:
+            await send_preview(update, context)
+        return
+
+    if waiting == "url" and text.strip() and not url:
+        if text.strip().lower() in {"нет", "не", "удалить", "убрать", "пропустить"}:
+            draft.product_url = None
+            draft.product_name = None
+            draft.waiting_for = None
+            await send_preview(update, context)
+        else:
             await message.reply_text("Не вижу ссылку. Пришли URL, начинающийся с https://")
+        return
+
+    if waiting == "discount_value" and text.strip():
+        amount = text.strip().replace(",", ".").replace("₽", "").replace("%", "").strip()
+        try:
+            number = float(amount)
+            if number <= 0 or (draft.discount_type == "percent" and number > 100):
+                raise ValueError
+            draft.discount_value = str(int(number)) if number.is_integer() else str(number).replace(".", ",")
+        except ValueError:
+            await message.reply_text("Введи положительное число" + (" от 1 до 100." if draft.discount_type == "percent" else ", например 500."))
             return
         draft.waiting_for = None
-    elif draft.waiting_for == "photo" and text:
+        draft.promo_discount_asked = True
+        await send_preview(update, context)
+        return
+
+    if waiting == "body_text" and text is not None:
+        draft.body_text = "" if text.strip().lower() in {"удалить", "убрать", "без текста"} else text.strip()
+        draft.waiting_for = None
+        await send_preview(update, context)
+        return
+
+    if waiting == "photo" and text.strip():
         if text.strip().lower() not in {"нет", "не", "пропустить", "готово"}:
             await message.reply_text("Пожалуйста, отправь фото или напиши «нет», чтобы пропустить.")
             return
         draft.waiting_for = None
 
-    # Если в сообщении уже есть фото, URL и/или промокод, задаём вопросы только о недостающем.
+    # Если прислали ссылку, сохраняем именно исходный URL для будущего поста.
+    # Конечный URL используется только для поиска ID и названия товара.
+    if url:
+        # Сохраняем именно ссылку, которую прислал пользователь (включая реферальные параметры).
+        # fetch_product_details может пройти по редиректам только для чтения названия;
+        # конечный URL никогда не записываем в draft.product_url.
+        draft.product_url = url
+        draft.product_name = None
+
+    if promo and not waiting:
+        draft.promo_code = promo
+        draft.promo_discount_asked = False
+
     has_any_input = bool(message.photo or url or promo or text.strip())
     if not has_any_input:
         await message.reply_text("Пришли фото, ссылку на товар или промокод.")
         return
 
-    if draft.product_url and not draft.product_name:
-        if looks_like_yandex_market(draft.product_url):
-            original_url = draft.product_url
-            # Сначала спрашиваем официальный API, затем используем раскрытие ссылки и HTML.
-            fetched_title = await fetch_title_from_yandex_api(original_url)
-            final_url, html_title = await fetch_product_details(original_url)
-            fetched_title = fetched_title or html_title
-            # Сохраняем раскрытый адрес, чтобы ссылка в посте вела прямо на товар.
-            if looks_like_yandex_market(final_url):
-                draft.product_url = final_url
-            product_id = product_id_from_url(final_url) or product_id_from_url(original_url)
-            draft.product_name = (
-                fetched_title
-                or PRODUCT_TITLE_OVERRIDES.get(product_id or "")
-                or transliterated_slug_to_russian(slug_from_url(final_url) or "")
-            )
-        else:
-            # Для любой другой ссылки оставляем название неизвестным.
-            draft.product_name = None
+    if draft.product_url and not draft.product_name and looks_like_yandex_market(draft.product_url):
+        original_url = draft.product_url
+        final_url, html_title = await fetch_product_details(original_url)
+        product_id = product_id_from_url(final_url) or product_id_from_url(original_url)
+        # Сначала используем настоящее название, извлечённое со страницы.
+        # Таблица известных ID — только резервный вариант, если страница не отдала название.
+        # Не транслитерируем slug: это часто создаёт неграмотные русские слова.
+        draft.product_name = PRODUCT_TITLE_OVERRIDES.get(product_id or "") or html_title
+        # ВАЖНО: draft.product_url не меняем на final_url — сохраняем ссылку пользователя.
 
-    # Если прислали фото + ссылку + промокод в одном сообщении, сразу показываем пост.
-    # Если название не удалось вытащить, используем текстовую ссылку без названия.
-    if message.photo and draft.product_url and draft.promo_code:
-        await send_preview(update, context)
+    # Если ссылка и промокод уже есть, но вопрос о скидке ещё не задавался — задаём его.
+    if draft.promo_code and not draft.promo_discount_asked:
+        draft.pending_question = "discount"
+        await message.reply_text(
+            "Добавить размер скидки к промокоду?",
+            reply_markup=build_yes_no_keyboard("discount"),
+        )
         return
 
-    # Если ссылку и промокод прислали вместе (без фото), не нужно повторно спрашивать о них.
     if draft.product_url and draft.promo_code:
         await send_preview(update, context)
         return
-
-    # Если это был ввод названия вручную и ссылка/промокод уже были, показываем превью.
-    if draft.product_name and (draft.product_url or draft.photo_file_id or draft.promo_code):
-        # Когда фото есть, но не хватает ссылки/промокода — спросим о недостающем.
-        if draft.product_url and draft.promo_code:
-            await send_preview(update, context)
-            return
 
     await ask_next(update, context)
 
@@ -611,6 +648,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         return
 
+    if data.startswith("discount:"):
+        if data.endswith(":yes"):
+            draft.pending_question = "discount_type"
+            await query.message.reply_text(
+                "Как указать скидку?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("В процентах (%)", callback_data="discount_type:percent")],
+                    [InlineKeyboardButton("В рублях (₽)", callback_data="discount_type:rubles")],
+                    [InlineKeyboardButton("Отмена скидки", callback_data="discount_type:none")],
+                ]),
+            )
+        else:
+            draft.discount_type = None
+            draft.discount_value = None
+            draft.promo_discount_asked = True
+            await send_preview(update, context)
+        return
+
+    if data.startswith("discount_type:"):
+        value = data.split(":", 1)[1]
+        if value == "none":
+            draft.discount_type = None
+            draft.discount_value = None
+            draft.promo_discount_asked = True
+            await send_preview(update, context)
+            return
+        draft.discount_type = value
+        draft.discount_value = None
+        draft.waiting_for = "discount_value"
+        unit = "процентах (например, 15)" if value == "percent" else "рублях (например, 500)"
+        await query.message.reply_text(f"Введи размер скидки в {unit}.")
+        return
+
+    if data == "edit_discount":
+        if not draft.promo_code:
+            await query.message.reply_text("Сначала добавь промокод, затем можно указать скидку.")
+            return
+        draft.pending_question = "discount_type"
+        await query.message.reply_text(
+            "Выбери тип скидки:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("В процентах (%)", callback_data="discount_type:percent")],
+                [InlineKeyboardButton("В рублях (₽)", callback_data="discount_type:rubles")],
+                [InlineKeyboardButton("Убрать скидку", callback_data="discount_type:none")],
+            ]),
+        )
+        return
+
+    if data == "edit_body":
+        draft.waiting_for = "body_text"
+        await query.message.reply_text(
+            "Отправь новый текст поста. Он будет расположен после промокода/скидки и перед ссылками на каналы. Чтобы убрать его, напиши «без текста»."
+        )
+        return
+
     if data == "edit_title":
         draft.waiting_for = "title"
         await query.message.reply_text("Отправь новое название товара одним сообщением.")
@@ -642,6 +734,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     "Есть промокод?",
                     reply_markup=build_yes_no_keyboard("promo"),
                 )
+            elif draft.promo_code and not draft.promo_discount_asked:
+                draft.pending_question = "discount"
+                await query.message.reply_text(
+                    "Добавить размер скидки к промокоду?",
+                    reply_markup=build_yes_no_keyboard("discount"),
+                )
             else:
                 await send_preview(update, context)
         return
@@ -658,6 +756,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     "Есть промокод?",
                     reply_markup=build_yes_no_keyboard("promo"),
                 )
+            elif draft.promo_code and not draft.promo_discount_asked:
+                draft.pending_question = "discount"
+                await query.message.reply_text(
+                    "Добавить размер скидки к промокоду?",
+                    reply_markup=build_yes_no_keyboard("discount"),
+                )
             else:
                 await send_preview(update, context)
         return
@@ -668,6 +772,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.message.reply_text("Отправь промокод, например: Промокод: SALE2026")
         else:
             draft.promo_code = None
+            draft.discount_type = None
+            draft.discount_value = None
+            draft.promo_discount_asked = True
             draft.pending_question = None
             await send_preview(update, context)
         return
