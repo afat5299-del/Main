@@ -42,6 +42,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Оставь пустым, если нужна только подготовка поста в личном чате.
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 
+# Необязательная интеграция с API реферальной программы Яндекс Маркета.
+# В .env укажи новый токен и свой CLID из кабинета; токен не вставляй в код.
+YANDEX_MARKET_API_TOKEN = os.getenv("YANDEX_MARKET_API_TOKEN", "").strip()
+YANDEX_MARKET_CLID = os.getenv("YANDEX_MARKET_CLID", "").strip()
+
 TELEGRAM_CHANNEL_URL = "https://t.me/+zOfQvQP-qcxmZjcy"
 MAX_CHANNEL_URL = "https://max.ru/channel_skidochnayapromo"
 
@@ -170,6 +175,41 @@ def transliterated_slug_to_russian(slug: str) -> Optional[str]:
         result = result.replace(old, new_char)
     result = re.sub(r"\s+", " ", result).strip()
     return result[:250].capitalize() if result else None
+
+
+async def fetch_title_from_yandex_api(url: str) -> Optional[str]:
+    """Получает точное название товара через API реферальной программы Маркета.
+
+    Для работы нужны YANDEX_MARKET_API_TOKEN и YANDEX_MARKET_CLID в .env.
+    Метод partner/link/create возвращает link.title для поддерживаемых URL.
+    """
+    if not YANDEX_MARKET_API_TOKEN or not YANDEX_MARKET_CLID:
+        return None
+    api_url = "https://api.content.market.yandex.ru/v3/affiliate/partner/link/create"
+    headers = {"Authorization": f"OAuth {YANDEX_MARKET_API_TOKEN}"}
+    params = {"url": url, "clid": YANDEX_MARKET_CLID, "format": "json"}
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(api_url, headers=headers, params=params) as response:
+                body_text = await response.text()
+                if response.status != 200:
+                    logger.warning("Yandex Market API: HTTP %s; ответ: %s", response.status, body_text[:300])
+                    return None
+                try:
+                    data = await response.json(content_type=None)
+                except Exception:
+                    logger.warning("Yandex Market API вернул ответ не в JSON")
+                    return None
+        link_data = data.get("link") or {}
+        title = clean_title(str(link_data.get("title") or ""))
+        if title and "яндекс маркет" not in title.lower():
+            logger.info("Название товара получено через API Яндекс Маркета")
+            return title
+        logger.info("API Яндекс Маркета не вернул название товара")
+    except Exception as exc:
+        logger.warning("Ошибка запроса к API Яндекс Маркета: %s", exc)
+    return None
 
 
 async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
@@ -474,7 +514,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if draft.product_url and not draft.product_name:
         if looks_like_yandex_market(draft.product_url):
             original_url = draft.product_url
-            final_url, fetched_title = await fetch_product_details(original_url)
+            # Сначала спрашиваем официальный API, затем используем раскрытие ссылки и HTML.
+            fetched_title = await fetch_title_from_yandex_api(original_url)
+            final_url, html_title = await fetch_product_details(original_url)
+            fetched_title = fetched_title or html_title
             # Сохраняем раскрытый адрес, чтобы ссылка в посте вела прямо на товар.
             if looks_like_yandex_market(final_url):
                 draft.product_url = final_url
