@@ -4,16 +4,16 @@ Python 3.10+
 """
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from html import escape
 from typing import Optional
 from urllib.parse import urlparse, unquote
+import asyncio
+import json
 
 import aiohttp
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -29,22 +29,21 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
-
 # ====================== НАСТРОЙКИ ======================
-# Вставь токен от @BotFather в файл .env, а не в этот код.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Вставь значения прямо сюда. Не отправляй файл с настоящими токенами посторонним.
+BOT_TOKEN = "8980549111:AAGobdsSazo_yuy1a68rIpV8sdTqsixshp0"
+TARGET_CHANNEL = "@ffffhhy1"
 
-# Публичный канал, куда бот может публиковать посты.
-# Примеры: @my_channel или -1001234567890
-# Оставь пустым, если нужна только подготовка поста в личном чате.
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
+MAX_BOT_TOKEN = "f9LHodD0cOLgmaZn46WBNS3wfD8_DjR0weBd0DOwN7R-PmTKRUz2Kgfkq5MD5mLHVFLTChaWGHsOptY4xDTs"
+# Числовой chat_id канала MAX, не ссылка на канал.
+MAX_TARGET_USER_ID = "ВСТАВЬ_ЧИСЛОВОЙ_USER_ID_MAX"
 
 TELEGRAM_CHANNEL_URL = "https://t.me/+zOfQvQP-qcxmZjcy"
 MAX_CHANNEL_URL = "https://max.ru/channel_skidochnayapromo"
 
 TELEGRAM_CHANNEL_TEXT = "Подписаться на наш канал"
 MAX_CHANNEL_TEXT = "Наш канал в Max"
+MAX_API_BASE = "https://platform-api2.max.ru"
 
 # Ограничение размера ответа страницы и сетевого тайм-аута.
 REQUEST_TIMEOUT_SECONDS = 12
@@ -67,11 +66,13 @@ class Draft:
     discount_type: Optional[str] = None  # "percent" или "rubles"
     discount_value: Optional[str] = None
     promo_discount_asked: bool = False
-    body_text: str = "Не пропускайте новые скидки и выгодные предложения"
+    body_text: str = "Не пропускайте новые скидки и выгодные предложения!"
     pending_question: Optional[str] = None
     waiting_for: Optional[str] = None
     # Несколько фото поддерживаются, но в этом примере используется первое.
     extra_photo_file_ids: list[str] = field(default_factory=list)
+    telegram_published: bool = False
+    max_published: bool = False
 
 
 # Черновики хранятся в памяти. При перезапуске бота незавершённые черновики исчезнут.
@@ -150,12 +151,36 @@ def slug_from_url(url: str) -> Optional[str]:
     return None
 
 
-async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
-    """Раскрывает короткую ссылку, но возвращает исходную ссылку отдельно от названия.
+def transliterated_slug_to_russian(slug: str) -> Optional[str]:
+    """Запасная эвристика: пытается преобразовать латинский slug в кириллицу."""
+    if not slug or not re.search(r"[a-z]", slug, re.I):
+        return None
+    text = re.sub(r"[-_]+", " ", slug).strip()
+    # Частые сочетания сначала, чтобы не разбивать их по одной букве.
+    replacements = [
+        ("shch", "щ"), ("sch", "щ"), ("yo", "ё"), ("zh", "ж"),
+        ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"),
+        ("sh", "ш"), ("yu", "ю"), ("ya", "я"), ("ye", "е"),
+        ("jo", "ё"), ("a", "а"), ("b", "б"), ("v", "в"),
+        ("g", "г"), ("d", "д"), ("e", "е"), ("z", "з"),
+        ("i", "и"), ("y", "й"), ("k", "к"), ("l", "л"),
+        ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"),
+        ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"),
+        ("f", "ф"), ("h", "х"), ("c", "к"), ("w", "в"),
+        ("x", "кс"), ("q", "к"),
+    ]
+    result = text.lower()
+    for old, new_char in replacements:
+        result = result.replace(old, new_char)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result[:250].capitalize() if result else None
 
-    Для названия в первую очередь используются структурированные данные карточки
-    Product и заголовок H1. Они обычно точнее общего og:title, который иногда
-    содержит SEO-slug с неграмотной транслитерацией.
+
+async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
+    """Раскрывает короткую ссылку редиректами и пытается получить название товара.
+
+    Возвращает (конечный URL, название или None). Короткие ссылки вида /cc/XXXX
+    не содержат название сами по себе, поэтому сначала переходим по редиректу.
     """
     headers = {
         "User-Agent": (
@@ -181,72 +206,26 @@ async def fetch_product_details(url: str) -> tuple[str, Optional[str]]:
                 html = raw.decode(response.charset or "utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "html.parser")
+        candidates = [
+            soup.find("meta", attrs={"property": "og:title"}),
+            soup.find("meta", attrs={"name": "twitter:title"}),
+        ]
+        for tag in candidates:
+            if tag and tag.get("content"):
+                title = clean_title(tag["content"])
+                if title and "яндекс маркет" not in title.lower():
+                    return final_url, title
 
-        def usable_title(value: object) -> Optional[str]:
-            title = clean_title(str(value or ""))
-            title = re.sub(r"\s*[|·]\s*Яндекс Маркет.*$", "", title, flags=re.I).strip()
-            title = re.sub(r"\s+", " ", title)
-            if not title or len(title) < 4:
-                return None
-            if "яндекс маркет" in title.lower() and len(title) < 70:
-                return None
-            # Отсекаем URL/технические slug и пустые заголовки.
-            if title.startswith(("http://", "https://")):
-                return None
-            if re.fullmatch(r"[a-z0-9_-]+", title, flags=re.I):
-                return None
-            return title[:250]
-
-        # Сначала собираем название из schema.org Product. Эти данные чаще всего
-        # содержат нормальное полное название, а не SEO-заголовок страницы.
-        import json
-        product_candidates = []
-
-        def walk_json(node):
-            if isinstance(node, dict):
-                node_type = node.get("@type", "")
-                types = node_type if isinstance(node_type, list) else [node_type]
-                if any(str(t).lower() == "product" for t in types) and node.get("name"):
-                    product_candidates.append(node["name"])
-                for value in node.values():
-                    walk_json(value)
-            elif isinstance(node, list):
-                for value in node:
-                    walk_json(value)
-
-        for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
-            try:
-                walk_json(json.loads(script.string or script.get_text()))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-
-        candidates = list(product_candidates)
         h1 = soup.find("h1")
         if h1:
-            candidates.append(h1.get_text(" ", strip=True))
-        for attrs in (
-            {"property": "og:title"},
-            {"name": "twitter:title"},
-        ):
-            tag = soup.find("meta", attrs=attrs)
-            if tag and tag.get("content"):
-                candidates.append(tag["content"])
-        if soup.title:
-            candidates.append(soup.title.get_text(" ", strip=True))
+            title = clean_title(h1.get_text(" ", strip=True))
+            if title and "яндекс маркет" not in title.lower():
+                return final_url, title
 
-        seen = set()
-        for candidate in candidates:
-            title = usable_title(candidate)
-            if not title:
-                continue
-            key = title.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            # Не берём технические заголовки из длинных адресных slug.
-            if title.count("-") >= 5 and not re.search(r"[А-ЯЁа-яё]", title):
-                continue
-            return final_url, title
+        if soup.title and soup.title.string:
+            title = clean_title(soup.title.string)
+            if title and "яндекс маркет" not in title.lower():
+                return final_url, title
     except Exception as exc:
         logger.info("Не удалось раскрыть ссылку или получить название: %s", exc)
     return final_url, None
@@ -281,14 +260,20 @@ def remove_urls_and_promo(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def footer_html() -> str:
+def footer_html(platform: str = "telegram") -> str:
+    # Telegram-версия сохраняет прежние подписи и ссылки.
+    if platform == "max":
+        return (
+            f'📣 <a href="{MAX_CHANNEL_URL}">{escape(TELEGRAM_CHANNEL_TEXT)}</a>\n'
+            f'📢 <a href="{TELEGRAM_CHANNEL_URL}">Наш канал в Телеграм</a>'
+        )
     return (
         f'📣 <a href="{TELEGRAM_CHANNEL_URL}">{escape(TELEGRAM_CHANNEL_TEXT)}</a>\n'
         f'📢 <a href="{MAX_CHANNEL_URL}">{escape(MAX_CHANNEL_TEXT)}</a>'
     )
 
 
-def make_post_html(draft: Draft) -> str:
+def make_post_html(draft: Draft, platform: str = "telegram") -> str:
     lines = []
 
     if draft.product_name and draft.product_url:
@@ -315,8 +300,83 @@ def make_post_html(draft: Draft) -> str:
         lines.extend(["", escape(draft.body_text.strip()), ""])
     else:
         lines.append("")
-    lines.append(footer_html())
+    lines.append(footer_html(platform))
     return "\n".join(lines)
+
+
+async def upload_photo_to_max(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str) -> str:
+    """Скачивает фото из Telegram и загружает его в MAX; возвращает media token."""
+    if not MAX_BOT_TOKEN or MAX_BOT_TOKEN.startswith("ВСТАВЬ_"):
+        raise RuntimeError("Не указан MAX_BOT_TOKEN в настройках кода.")
+    tg_file = await context.bot.get_file(photo_file_id)
+    photo_bytes = bytes(await tg_file.download_as_bytearray())
+
+    headers = {"Authorization": MAX_BOT_TOKEN, "Accept": "application/json"}
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(f"{MAX_API_BASE}/uploads?type=image", headers=headers) as response:
+            payload = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(f"MAX не выдал ссылку для загрузки фото: HTTP {response.status}: {payload}")
+        upload_url = payload.get("url")
+        if not upload_url:
+            raise RuntimeError(f"MAX API не вернул URL для загрузки изображения: {payload}")
+
+        form = aiohttp.FormData()
+        form.add_field("data", photo_bytes, filename="product.jpg", content_type="image/jpeg")
+        async with session.post(upload_url, headers={"Authorization": MAX_BOT_TOKEN}, data=form) as response:
+            uploaded = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(f"MAX не принял фото: HTTP {response.status}: {uploaded}")
+
+    token = uploaded.get("token") if isinstance(uploaded, dict) else None
+    if not token and isinstance(uploaded, dict):
+        photos = uploaded.get("photos", {})
+        if isinstance(photos, dict):
+            for photo_info in photos.values():
+                if isinstance(photo_info, dict) and photo_info.get("token"):
+                    token = photo_info["token"]
+                    break
+    if not token:
+        raise RuntimeError(f"MAX не вернул токен загруженного изображения: {uploaded}")
+    return token
+
+
+async def publish_to_max(context: ContextTypes.DEFAULT_TYPE, draft: Draft) -> None:
+    """Публикует отдельную MAX-версию поста через официальный MAX Bot API."""
+    if not MAX_BOT_TOKEN or MAX_BOT_TOKEN.startswith("ВСТАВЬ_"):
+        raise RuntimeError("Не указан MAX_BOT_TOKEN в настройках кода.")
+    if not MAX_TARGET_USER_ID or MAX_TARGET_USER_ID.startswith("ВСТАВЬ_"):
+        raise RuntimeError("Не указан MAX_TARGET_USER_ID в настройках кода.")
+    try:
+        user_id = int(MAX_TARGET_USER_ID)
+    except ValueError as exc:
+        raise RuntimeError("MAX_TARGET_USER_ID должен быть числовым user_id пользователя MAX.") from exc
+
+    headers = {"Authorization": MAX_BOT_TOKEN, "Content-Type": "application/json", "Accept": "application/json"}
+    body = {"text": make_post_html(draft, platform="max"), "format": "html"}
+    if draft.photo_file_id:
+        media_token = await upload_photo_to_max(context, draft.photo_file_id)
+        body["attachments"] = [{"type": "image", "payload": {"token": media_token}}]
+
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt, delay in enumerate((0.8, 1.5, 3.0), start=1):
+            if draft.photo_file_id:
+                await asyncio.sleep(delay)
+            async with session.post(
+                f"{MAX_API_BASE}/messages",
+                params={"user_id": user_id},
+                headers=headers,
+                json=body,
+            ) as response:
+                result = await response.json(content_type=None)
+                if response.status < 400:
+                    return
+                error_text = json.dumps(result, ensure_ascii=False)
+                if "attachment.not.ready" in error_text and attempt < 3:
+                    continue
+                raise RuntimeError(f"MAX API вернул HTTP {response.status}: {error_text}")
 
 
 def build_yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
@@ -332,7 +392,7 @@ def build_yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 def build_preview_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("✅ Опубликовать в канал", callback_data="publish")],
+        [InlineKeyboardButton("✅ Опубликовать в Telegram и MAX", callback_data="publish")],
         [InlineKeyboardButton("✏️ Изменить название", callback_data="edit_title")],
         [InlineKeyboardButton("✏️ Изменить промокод", callback_data="edit_promo")],
         [InlineKeyboardButton("💸 Изменить скидку", callback_data="edit_discount")],
@@ -341,7 +401,7 @@ def build_preview_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Создать ещё", callback_data="new")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ]
-    if not TARGET_CHANNEL:
+    if not TARGET_CHANNEL or TARGET_CHANNEL.startswith("ВСТАВЬ_"):
         rows[0] = [InlineKeyboardButton(
             "ℹ️ Настрой TARGET_CHANNEL для публикации",
             callback_data="publish_help",
@@ -548,9 +608,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Если прислали ссылку, сохраняем именно исходный URL для будущего поста.
     # Конечный URL используется только для поиска ID и названия товара.
     if url:
-        # Сохраняем именно ссылку, которую прислал пользователь (включая реферальные параметры).
-        # fetch_product_details может пройти по редиректам только для чтения названия;
-        # конечный URL никогда не записываем в draft.product_url.
         draft.product_url = url
         draft.product_name = None
 
@@ -567,10 +624,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         original_url = draft.product_url
         final_url, html_title = await fetch_product_details(original_url)
         product_id = product_id_from_url(final_url) or product_id_from_url(original_url)
-        # Сначала используем настоящее название, извлечённое со страницы.
-        # Таблица известных ID — только резервный вариант, если страница не отдала название.
-        # Не транслитерируем slug: это часто создаёт неграмотные русские слова.
-        draft.product_name = PRODUCT_TITLE_OVERRIDES.get(product_id or "") or html_title
+        # Приоритет: точное название для известного ID, затем название страницы,
+        # затем резервная попытка прочитать название из URL.
+        draft.product_name = (
+            PRODUCT_TITLE_OVERRIDES.get(product_id or "")
+            or html_title
+            or transliterated_slug_to_russian(slug_from_url(final_url) or "")
+        )
         # ВАЖНО: draft.product_url не меняем на final_url — сохраняем ссылку пользователя.
 
     # Если ссылка и промокод уже есть, но вопрос о скидке ещё не задавался — задаём его.
@@ -612,39 +672,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data == "publish_help":
         await query.message.reply_text(
-            "Чтобы публиковать в канал, добавь в файл .env строку TARGET_CHANNEL=@имя_канала "
-            "и сделай бота администратором канала с правом публикации."
+            "Вставь TARGET_CHANNEL в настройки в начале bot.py и сделай Telegram-бота "
+            "администратором канала с правом публикации. Для MAX укажи числовой "
+            "MAX_TARGET_USER_ID; получатель должен предварительно запустить MAX-бота."
         )
         return
 
     if data == "publish":
-        if not TARGET_CHANNEL:
-            await query.message.reply_text(
-                "Не настроен TARGET_CHANNEL в файле .env. См. инструкцию в README."
-            )
-            return
-        try:
-            if draft.photo_file_id:
-                await context.bot.send_photo(
-                    chat_id=TARGET_CHANNEL,
-                    photo=draft.photo_file_id,
-                    caption=make_post_html(draft),
-                    parse_mode=ParseMode.HTML,
-                )
+        errors = []
+
+        if not draft.telegram_published:
+            if TARGET_CHANNEL and not TARGET_CHANNEL.startswith("ВСТАВЬ_"):
+                try:
+                    if draft.photo_file_id:
+                        await context.bot.send_photo(
+                            chat_id=TARGET_CHANNEL,
+                            photo=draft.photo_file_id,
+                            caption=make_post_html(draft, platform="telegram"),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=TARGET_CHANNEL,
+                            text=make_post_html(draft, platform="telegram"),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    draft.telegram_published = True
+                except Exception as exc:
+                    logger.exception("Не удалось опубликовать пост в Telegram: %s", exc)
+                    errors.append(f"Telegram: {exc}")
             else:
-                await context.bot.send_message(
-                    chat_id=TARGET_CHANNEL,
-                    text=make_post_html(draft),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            await query.message.reply_text("✅ Пост опубликован в канал.")
+                errors.append("Telegram: не настроен TARGET_CHANNEL.")
+
+        if not draft.max_published:
+            try:
+                await publish_to_max(context, draft)
+                draft.max_published = True
+            except Exception as exc:
+                logger.exception("Не удалось опубликовать пост в MAX: %s", exc)
+                errors.append(f"MAX: {exc}")
+
+        if draft.telegram_published and draft.max_published:
+            await query.message.reply_text("✅ Пост отправлен в Telegram-канал и личный диалог MAX.")
             reset_draft(user_id)
-        except Exception as exc:
-            logger.exception("Не удалось опубликовать пост: %s", exc)
+        else:
+            published = []
+            if draft.telegram_published:
+                published.append("Telegram")
+            if draft.max_published:
+                published.append("MAX")
+            status = ", ".join(published) if published else "ни в один канал"
             await query.message.reply_text(
-                "Не удалось опубликовать пост. Проверь, что бот добавлен в канал "
-                "администратором и TARGET_CHANNEL указан правильно."
+                f"⚠️ Опубликовано: {status}.\n"
+                "Неуспешные платформы можно попробовать повторно — уже отправленное сообщение не будет отправлено повторно.\n\n"
+                + ("\n".join(errors) if errors else "Проверь настройки.")
             )
         return
 
@@ -699,7 +781,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "edit_body":
         draft.waiting_for = "body_text"
         await query.message.reply_text(
-            "Отправь новый текст поста. Он будет расположен после промокода/скидки и перед ссылками на каналы. Чтобы убрать его, напиши «без текста»."
+            "Отправь новый текст, который будет после промокода. Чтобы убрать этот текст, напиши «без текста»."
         )
         return
 
@@ -785,11 +867,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit(
-            "Не найден BOT_TOKEN. Создай файл .env по образцу .env.example "
-            "и вставь токен от @BotFather."
-        )
+    if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬ_"):
+        raise SystemExit("Вставь настоящий BOT_TOKEN в настройки в начале файла bot.py.")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
